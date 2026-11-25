@@ -204,12 +204,29 @@ pub(crate) fn suspend_effect_tracking<F, R>(f: F) -> R
 where
     F: FnOnce() -> R,
 {
-    let saved: Vec<_> =
-        with_reactive(|reactive| reactive.effect_tracking.borrow_mut().drain(..).collect());
-    // Restore on unwind too: losing the saved stack would silently drop the
-    // dependencies of every effect currently on the stack.
+    // Set the live stack aside into a recycled buffer, so an untracked derived
+    // read does not allocate a fresh Vec each call.
+    let mut saved = with_reactive(|reactive| {
+        let mut saved = reactive
+            .suspend_scratch
+            .borrow_mut()
+            .pop()
+            .unwrap_or_default();
+        saved.append(&mut reactive.effect_tracking.borrow_mut());
+        saved
+    });
+    // Restore on unwind too, and recycle the buffer. `f`'s reads are untracked,
+    // so the stack is empty here and the entries come back in order.
     let _guard = super::guard::defer(move || {
-        with_reactive(|reactive| *reactive.effect_tracking.borrow_mut() = saved);
+        with_reactive(|reactive| {
+            let mut tracking = reactive.effect_tracking.borrow_mut();
+            tracking.clear();
+            tracking.append(&mut saved);
+            let mut pool = reactive.suspend_scratch.borrow_mut();
+            if pool.len() < 4 {
+                pool.push(saved);
+            }
+        });
     });
     f()
 }
@@ -934,5 +951,46 @@ mod tests {
         // The effect must still be alive, tracked, and re-runnable
         sig.set(2);
         assert_eq!(observed.get(), 2);
+    }
+
+    /// `suspend_effect_tracking` sets the effect-read stack aside and puts it
+    /// back whole, including when it nests, and recycles the buffer it used
+    /// rather than allocating a fresh one on every untracked derived read.
+    #[test]
+    fn suspend_effect_tracking_restores_the_stack_and_recycles_its_buffer() {
+        let effect = EffectId {
+            index: 0,
+            generation: 0,
+        };
+
+        // A stack of two, as if two effects were mid-run.
+        with_reactive(|reactive| {
+            let mut tracking = reactive.effect_tracking.borrow_mut();
+            tracking.push((effect, EffectReads::default()));
+            tracking.push((effect, EffectReads::default()));
+        });
+
+        // Inside the suspend the stack is empty, and a nested suspend sees it
+        // empty too — the outer stack is set aside, not shared with the inner.
+        suspend_effect_tracking(|| {
+            assert!(with_reactive(|r| r.effect_tracking.borrow().is_empty()));
+            suspend_effect_tracking(|| {
+                assert!(with_reactive(|r| r.effect_tracking.borrow().is_empty()));
+            });
+            assert!(with_reactive(|r| r.effect_tracking.borrow().is_empty()));
+        });
+
+        // The stack is back, in order, and the buffer used was recycled.
+        let (restored, pooled) = with_reactive(|reactive| {
+            (
+                reactive.effect_tracking.borrow().len(),
+                reactive.suspend_scratch.borrow().len(),
+            )
+        });
+        assert_eq!(restored, 2, "the suspended stack came back whole");
+        assert!(pooled >= 1, "the buffer it used was recycled, not dropped");
+
+        // Leave the thread's stack as this test found it.
+        with_reactive(|reactive| reactive.effect_tracking.borrow_mut().clear());
     }
 }

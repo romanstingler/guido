@@ -79,6 +79,10 @@ pub(crate) struct ReactiveState {
     /// Reads made while an effect runs, buffered because `runtime` is already
     /// borrowed then.
     pub(crate) effect_tracking: RefCell<Vec<(EffectId, EffectReads)>>,
+    /// Recycled buffers for the stack [`suspend_effect_tracking`](super::runtime::suspend_effect_tracking)
+    /// sets aside, so an untracked derived read does not allocate a fresh `Vec`
+    /// each call. A field, so `reset` empties it with the rest.
+    pub(crate) suspend_scratch: RefCell<Vec<Vec<(EffectId, EffectReads)>>>,
     /// Signal-to-widget subscriptions, written by a read and consumed by a
     /// write that share no argument. A `RefCell` rather than a lock because
     /// all access is on the main thread: a background write goes through
@@ -136,6 +140,7 @@ pub(crate) fn reset() {
             storage,
             runtime,
             effect_tracking,
+            suspend_scratch,
             subscribers,
             globals,
             write_route,
@@ -160,6 +165,7 @@ pub(crate) fn reset() {
         // one, which opens a route of its own.
         write_route.close();
         effect_tracking.take();
+        suspend_scratch.take();
         tracking_context.take();
 
         current_owner.take();
